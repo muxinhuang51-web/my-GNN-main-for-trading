@@ -1,339 +1,312 @@
-import os
-import numpy as np
-import pandas as pd
-import torch
-from torch_geometric.data import Data
-from sklearn.cluster import KMeans
-
-from models.embedding_model import load_embedding_model, extract_embeddings
-from models.cluster_predictor import build_cluster_samples, ClusterReturnPredictor, train_cluster_predictor, predict_cluster_returns
-
-
-def set_seed(seed_value):
-    torch.manual_seed(seed_value)
-    np.random.seed(seed_value)
-    print("[状态] 随机种子已设置")
-
-
-def load_returns_csv(path):
-    if not os.path.exists(path):
-        raise FileNotFoundError("收益率文件不存在")
-    df = pd.read_csv(path)
-    date_col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df.set_index(date_col)
-    df.columns = [str(c) for c in df.columns]
-    df = df.apply(pd.to_numeric, errors="coerce")
-    return df
-
-
-def run_daily_cluster_backtest(
-    data_dir="data",
-    model_path="best_model.pt",
-    lookback=60,
-    top_neighbor_count=20,
-    cluster_count=20,
-    seed_value=42,
-    device=None,
-    out_dir="outputs/cluster_backtest",
-    start_date=None,
-    end_date=None,
-):
-    os.makedirs(out_dir, exist_ok=True)
-    set_seed(seed_value)
-    device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-    returns = load_returns_csv(os.path.join(data_dir, "daily_returns.csv"))
-    stock_codes = list(returns.columns)
-    # minimal industry/concept loaders from notebooks
-    industry_df = pd.read_csv(os.path.join(data_dir, "industry_mapping.csv"))
-    industry_df["ts_code"] = industry_df["ts_code"].astype(str)
-    concept_candidates = [os.path.join(data_dir, "stock_concept.csv"), os.path.join(data_dir, "concept_mapping.csv"), os.path.join(data_dir, "stock_concepts.csv")]
-    concept_path = next((p for p in concept_candidates if os.path.exists(p)), None)
-    concept_df = pd.read_csv(concept_path) if concept_path else pd.DataFrame(columns=["ts_code", "concept"])
-
-    # date slicing
-    dates = returns.index.dropna()
-    if start_date:
-        dates = dates[dates >= pd.to_datetime(start_date)]
-    if end_date:
-        dates = dates[dates <= pd.to_datetime(end_date)]
-    results = []  # daily returns
-
-    model = load_embedding_model(model_path, in_channels=6, hidden_channels=64, num_relations=3, device=device)
-
-    for i, date in enumerate(dates):
-        if i < lookback:
-            continue
-        print(f"[状态] 回测日期 {date.date()} (index={i})")
-        window = returns.iloc[i - lookback:i]
-        # build features (reuse code from notebook)
-        momentum_20 = (1 + window.tail(20)).prod() - 1
-        mean_5 = window.tail(5).mean()
-        mean_10 = window.tail(10).mean()
-        vol20 = window.tail(20).std(ddof=0)
-        vol60 = window.tail(60).std(ddof=0)
-        last_ret = window.tail(1).iloc[0]
-        feature_frame = pd.DataFrame({
-            "mom20": momentum_20,
-            "mean5": mean_5,
-            "mean10": mean_10,
-            "vol20": vol20,
-            "vol60": vol60,
-            "last_ret": last_ret,
-        })
-        feature_frame = (feature_frame - feature_frame.mean()) / feature_frame.std().replace(0, np.nan)
-        feature_frame = feature_frame.reindex(stock_codes).fillna(0.0)
-        # build simple edges (industry + concept)
-        stock2index = {code: idx for idx, code in enumerate(stock_codes)}
-        def build_group_edges(mapping_df, stock2index, stock_column, group_column, max_neighbors=20):
-            edge_pairs = set()
-            grouped = mapping_df.groupby(group_column)[stock_column].apply(list).to_dict()
-            for members in grouped.values():
-                members = [c for c in members if c in stock2index]
-                for source in members:
-                    peers = [c for c in members if c != source]
-                    if len(peers) > max_neighbors:
-                        peers = peers[:max_neighbors]
-                    for target in peers:
-                        edge_pairs.add((stock2index[source], stock2index[target]))
-            if not edge_pairs:
-                return torch.empty((2, 0), dtype=torch.long)
-            return torch.tensor(sorted(edge_pairs), dtype=torch.long).t().contiguous()
-        industry_edge = build_group_edges(industry_df, stock2index, "ts_code", "industry")
-        concept_edge = build_group_edges(concept_df, stock2index, "ts_code", "concept")
-        # no corr edges for speed
-        edge_index = torch.cat([industry_edge, concept_edge], dim=1) if industry_edge.size(1) + concept_edge.size(1) > 0 else torch.empty((2,0), dtype=torch.long)
-        edge_type = torch.cat([
-            torch.zeros(industry_edge.size(1), dtype=torch.long) if industry_edge.size(1)>0 else torch.empty((0,), dtype=torch.long),
-            torch.ones(concept_edge.size(1), dtype=torch.long) if concept_edge.size(1)>0 else torch.empty((0,), dtype=torch.long),
-        ]) if edge_index.size(1)>0 else torch.empty((0,), dtype=torch.long)
-        data = Data(x=torch.tensor(feature_frame.to_numpy(dtype=float), dtype=torch.float), edge_index=edge_index, edge_type=edge_type)
-        embeddings = extract_embeddings(model, data, device)
-        # clustering
-        kmeans = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10)
-        cluster_labels = kmeans.fit_predict(embeddings)
-        # build cluster samples
-        next_return = returns.iloc[i].to_numpy(dtype=float)
-        try:
-            cluster_features, cluster_labels_mean, cluster_id_list = build_cluster_samples(embeddings, cluster_labels, next_return)
-        except ValueError as e:
-            print(f"[警告] 构造簇级样本失败：{e}")
-            continue
-        predictor = ClusterReturnPredictor(input_dim=cluster_features.shape[1], hidden_dim=32, dropout_rate=0.1)
-        predictor = train_cluster_predictor(predictor, cluster_features, cluster_labels_mean, device, epochs=10, batch_size=16, learning_rate=1e-3)
-        cluster_preds = predict_cluster_returns(predictor, cluster_features, device)
-        # select top cluster(s)
-        top_k = max(1, int(cluster_count * 0.1))
-        top_idx = np.argsort(cluster_preds)[-top_k:][::-1]
-        selected_clusters = [cluster_id_list[idx] for idx in top_idx]
-        selected_stocks = [code for code, label in zip(stock_codes, cluster_labels) if label in selected_clusters]
-        # compute portfolio return: equal weight across selected stocks
-        if not selected_stocks:
-            daily_ret = 0.0
-        else:
-            sel_idx = [stock_codes.index(c) for c in selected_stocks]
-            stock_next = returns.iloc[i].to_numpy(dtype=float)
-            daily_ret = np.nanmean(stock_next[sel_idx])
-        results.append({"date": date, "daily_return": daily_ret, "num_stocks": len(selected_stocks)})
-        if (i - lookback) % 10 == 0:
-            # checkpoint outputs
-            pd.DataFrame(results).to_csv(os.path.join(out_dir, "daily_returns_partial.csv"), index=False)
-    # finalize
-    result_df = pd.DataFrame(results)
-    out_csv = os.path.join(out_dir, "daily_returns.csv")
-    result_df.to_csv(out_csv, index=False)
-    print(f"[状态] 回测完成，输出 -> {out_csv}")
-    return result_df
-
-
-if __name__ == "__main__":
-    run_daily_cluster_backtest()
-import os
 import json
-from typing import List
+import os
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.cluster import KMeans
+from torch_geometric.data import Data
 
-from models.embedding_model import load_embedding_model, extract_embeddings
 from models.cluster_predictor import (
-    build_cluster_samples,
     ClusterReturnPredictor,
-    train_cluster_predictor,
+    build_cluster_feature_samples,
+    build_cluster_samples,
     predict_cluster_returns,
+    train_cluster_predictor,
 )
+from models.embedding_model import extract_embeddings, load_embedding_model
 
 
-def set_seed(seed_value: int):
+def set_seed(seed_value: int) -> None:
     torch.manual_seed(seed_value)
     np.random.seed(seed_value)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_value)
 
 
 def load_returns_csv(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"收益率文件不存在: {path}")
-    df = pd.read_csv(path)
-    date_col = "trade_date" if "trade_date" in df.columns else df.columns[0]
-    dates = pd.to_datetime(df[date_col], errors="coerce")
-    returns = df.drop(columns=[date_col], errors="ignore")
-    returns.columns = [str(c) for c in returns.columns]
+    dataframe = pd.read_csv(path)
+    date_col = "trade_date" if "trade_date" in dataframe.columns else dataframe.columns[0]
+    dates = pd.to_datetime(dataframe[date_col], errors="coerce")
+    returns = dataframe.drop(columns=[date_col], errors="ignore")
+    returns.columns = [str(column) for column in returns.columns]
     returns = returns.apply(pd.to_numeric, errors="coerce")
     returns.index = dates
+    returns = returns[~returns.index.isna()].sort_index()
     return returns
 
 
-def load_industry_mapping(path: str, stock_codes: List[str]) -> pd.DataFrame:
+def load_industry_mapping(path: str, stock_codes: Sequence[str]) -> pd.DataFrame:
     if not os.path.exists(path):
         raise FileNotFoundError(f"行业映射不存在: {path}")
-    df = pd.read_csv(path)
-    df["ts_code"] = df["ts_code"].astype(str)
-    df = df[df["ts_code"].isin(stock_codes)].copy()
-    return df
+    dataframe = pd.read_csv(path)
+    dataframe["ts_code"] = dataframe["ts_code"].astype(str)
+    return dataframe[dataframe["ts_code"].isin(stock_codes)].copy()
 
 
-def load_concept_mapping(data_dir: str, stock_codes: List[str]) -> pd.DataFrame:
+def load_concept_mapping(data_dir: str, stock_codes: Sequence[str]) -> pd.DataFrame:
     candidates = [
         os.path.join(data_dir, "stock_concept.csv"),
         os.path.join(data_dir, "concept_mapping.csv"),
         os.path.join(data_dir, "stock_concepts.csv"),
     ]
-    path = next((p for p in candidates if os.path.exists(p)), None)
+    path = next((candidate for candidate in candidates if os.path.exists(candidate)), None)
     if path is None:
         return pd.DataFrame(columns=["ts_code", "concept"])
-    df = pd.read_csv(path)
-    if "ts_code" not in df.columns:
+
+    dataframe = pd.read_csv(path)
+    if "ts_code" not in dataframe.columns:
         return pd.DataFrame(columns=["ts_code", "concept"])
-    concept_col = next((c for c in df.columns if c != "ts_code"), None)
+    concept_col = next((column for column in dataframe.columns if column != "ts_code"), None)
     if concept_col is None:
         return pd.DataFrame(columns=["ts_code", "concept"])
-    df = df[["ts_code", concept_col]].copy()
-    df.columns = ["ts_code", "concept"]
-    df["ts_code"] = df["ts_code"].astype(str)
-    df = df[df["ts_code"].isin(stock_codes)].copy()
-    return df
+
+    result = dataframe[["ts_code", concept_col]].copy()
+    result.columns = ["ts_code", "concept"]
+    result["ts_code"] = result["ts_code"].astype(str)
+    return result[result["ts_code"].isin(stock_codes)].copy()
 
 
-def zscore_by_column(df: pd.DataFrame) -> pd.DataFrame:
-    mean = df.mean(axis=0)
-    std = df.std(axis=0).replace(0, np.nan)
-    return (df - mean) / std
+def zscore_by_column(dataframe: pd.DataFrame) -> pd.DataFrame:
+    mean = dataframe.mean(axis=0)
+    std = dataframe.std(axis=0).replace(0, np.nan)
+    return (dataframe - mean) / std
 
 
 def build_features_from_window(window_dataframe: pd.DataFrame) -> pd.DataFrame:
     momentum_20 = (1 + window_dataframe.tail(20)).prod() - 1
     mean_5 = window_dataframe.tail(5).mean()
     mean_10 = window_dataframe.tail(10).mean()
-    vol20 = window_dataframe.tail(20).std(ddof=0)
-    vol60 = window_dataframe.tail(60).std(ddof=0)
-    last = window_dataframe.tail(1).iloc[0]
-    feature_frame = pd.DataFrame({
-        "mom20": momentum_20,
-        "mean5": mean_5,
-        "mean10": mean_10,
-        "vol20": vol20,
-        "vol60": vol60,
-        "last_ret": last,
-    })
+    volatility_20 = window_dataframe.tail(20).std(ddof=0)
+    volatility_60 = window_dataframe.tail(60).std(ddof=0)
+    last_return = window_dataframe.tail(1).iloc[0]
+    feature_frame = pd.DataFrame(
+        {
+            "mom20": momentum_20,
+            "mean5": mean_5,
+            "mean10": mean_10,
+            "vol20": volatility_20,
+            "vol60": volatility_60,
+            "last_ret": last_return,
+        }
+    )
     return zscore_by_column(feature_frame)
 
 
-def build_stock2index(stock_codes: List[str]) -> dict:
-    return {code: idx for idx, code in enumerate(stock_codes)}
+def build_stock2index(stock_codes: Sequence[str]) -> Dict[str, int]:
+    return {code: index for index, code in enumerate(stock_codes)}
 
 
-def build_group_edges(mapping_df: pd.DataFrame, stock2index: dict, stock_column: str, group_column: str, max_neighbors: int = 20):
+def build_group_edges(
+    mapping_df: pd.DataFrame,
+    stock2index: Dict[str, int],
+    stock_column: str,
+    group_column: str,
+    max_neighbors: int = 20,
+) -> Optional[np.ndarray]:
+    if mapping_df.empty or stock_column not in mapping_df.columns or group_column not in mapping_df.columns:
+        return None
+
     edge_pairs = set()
     grouped = mapping_df.groupby(group_column)[stock_column].apply(list).to_dict()
     for members in grouped.values():
-        members = [c for c in members if c in stock2index]
+        members = sorted({member for member in members if member in stock2index}, key=stock2index.get)
         for source in members:
-            peers = [c for c in members if c != source]
-            if len(peers) > max_neighbors:
-                peers = peers[:max_neighbors]
+            peers = [member for member in members if member != source][:max_neighbors]
             for target in peers:
                 edge_pairs.add((stock2index[source], stock2index[target]))
     if not edge_pairs:
         return None
-    edge_index = np.array(sorted(edge_pairs)).T
-    return edge_index
+    return np.array(sorted(edge_pairs), dtype=np.int64).T
 
 
-def build_corr_edges(window_dataframe: pd.DataFrame, top_neighbor_count: int = 20):
-    values = window_dataframe.to_numpy(dtype=float)
-    if values.shape[0] < 5:
+def build_corr_edges(
+    window_dataframe: pd.DataFrame,
+    top_neighbor_count: int = 20,
+    min_overlap: int = 20,
+) -> Optional[np.ndarray]:
+    if len(window_dataframe) < min_overlap:
         return None
-    corr = np.corrcoef(values.T)
+
+    corr = window_dataframe.astype(float).corr(min_periods=min_overlap).to_numpy(dtype=float)
     edge_pairs = set()
-    for i in range(corr.shape[0]):
-        row = corr[i].copy()
-        row[i] = -np.inf
-        idx = np.argsort(np.abs(row))[-top_neighbor_count:]
-        for j in idx:
-            if np.isfinite(row[j]):
-                edge_pairs.add((i, j))
+    for source_index in range(corr.shape[0]):
+        row = corr[source_index].copy()
+        row[source_index] = np.nan
+        finite_mask = np.isfinite(row)
+        if not finite_mask.any():
+            continue
+        candidates = np.flatnonzero(finite_mask)
+        ranked = candidates[np.argsort(np.abs(row[candidates]))]
+        for target_index in ranked[-top_neighbor_count:]:
+            edge_pairs.add((source_index, int(target_index)))
+
     if not edge_pairs:
         return None
-    return np.array(sorted(edge_pairs)).T
+    return np.array(sorted(edge_pairs), dtype=np.int64).T
 
 
-def build_data_for_index(returns: pd.DataFrame, industry_df: pd.DataFrame, concept_df: pd.DataFrame, stock_codes: List[str], time_index: int, lookback: int, top_neighbor_count: int):
+def tensor_from_edges(edge_index: Optional[np.ndarray]) -> torch.Tensor:
+    if edge_index is None:
+        return torch.empty((2, 0), dtype=torch.long)
+    return torch.tensor(edge_index, dtype=torch.long)
+
+
+def build_data_for_index(
+    returns: pd.DataFrame,
+    industry_df: pd.DataFrame,
+    concept_df: pd.DataFrame,
+    stock_codes: Sequence[str],
+    time_index: int,
+    lookback: int,
+    top_neighbor_count: int,
+) -> Data:
+    if time_index < lookback:
+        raise ValueError("time_index 小于 lookback，无法构造历史窗口")
+
     window = returns.iloc[time_index - lookback:time_index]
     feature_frame = build_features_from_window(window).reindex(stock_codes).fillna(0.0)
     stock2index = build_stock2index(stock_codes)
-    industry_edge = build_group_edges(industry_df, stock2index, "ts_code", "industry", max_neighbors=20)
-    concept_edge = build_group_edges(concept_df, stock2index, "ts_code", "concept", max_neighbors=20)
-    corr_edge = build_corr_edges(window, top_neighbor_count=top_neighbor_count)
-    # build a simple container to feed embedding extractor (only the attributes used)
-    class SimpleData:
-        pass
 
-    data = SimpleData()
-    data.x = torch.tensor(feature_frame.to_numpy(dtype=float), dtype=torch.float)
-    # pack edges as tensors expected by embedding extractor
-    edges = []
-    types = []
-    if industry_edge is not None:
-        edges.append(torch.tensor(industry_edge, dtype=torch.long))
-        types.append(torch.zeros(industry_edge.shape[1], dtype=torch.long))
-    if concept_edge is not None:
-        edges.append(torch.tensor(concept_edge, dtype=torch.long))
-        types.append(torch.ones(concept_edge.shape[1], dtype=torch.long))
-    if corr_edge is not None:
-        edges.append(torch.tensor(corr_edge, dtype=torch.long))
-        types.append(torch.full((corr_edge.shape[1],), 2, dtype=torch.long))
-    if edges:
-        data.edge_index = torch.cat(edges, dim=1).contiguous()
-        data.edge_type = torch.cat(types, dim=0).contiguous()
-    else:
-        data.edge_index = torch.empty((2, 0), dtype=torch.long)
-        data.edge_type = torch.empty((0,), dtype=torch.long)
-    return data
+    industry_edge = tensor_from_edges(
+        build_group_edges(industry_df, stock2index, "ts_code", "industry", max_neighbors=20)
+    )
+    concept_edge = tensor_from_edges(
+        build_group_edges(concept_df, stock2index, "ts_code", "concept", max_neighbors=20)
+    )
+    corr_edge = tensor_from_edges(
+        build_corr_edges(window.reindex(columns=stock_codes), top_neighbor_count=top_neighbor_count)
+    )
+
+    edge_parts = [industry_edge, concept_edge, corr_edge]
+    type_parts = [
+        torch.zeros(industry_edge.size(1), dtype=torch.long),
+        torch.ones(concept_edge.size(1), dtype=torch.long),
+        torch.full((corr_edge.size(1),), 2, dtype=torch.long),
+    ]
+    edge_index = torch.cat(edge_parts, dim=1).contiguous()
+    edge_type = torch.cat(type_parts, dim=0).contiguous()
+
+    return Data(
+        x=torch.tensor(feature_frame.to_numpy(dtype=float), dtype=torch.float),
+        edge_index=edge_index,
+        edge_type=edge_type,
+    )
 
 
-def compute_metrics(daily_returns: List[float]):
-    arr = np.array(daily_returns)
+def date_positions(
+    returns: pd.DataFrame,
+    lookback: int,
+    train_window: int,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> List[int]:
+    start_index = lookback + train_window
+    valid_positions = list(range(start_index, len(returns)))
+    if start_date is not None:
+        start = pd.to_datetime(start_date)
+        valid_positions = [index for index in valid_positions if returns.index[index] >= start]
+    if end_date is not None:
+        end = pd.to_datetime(end_date)
+        valid_positions = [index for index in valid_positions if returns.index[index] <= end]
+    return valid_positions
+
+
+def compute_portfolio_return(returns_row: pd.Series, selected_stocks: Sequence[str], min_valid_stocks: int = 1) -> float:
+    if not selected_stocks:
+        return 0.0
+    valid_returns = returns_row.reindex(selected_stocks).dropna()
+    if len(valid_returns) < min_valid_stocks:
+        return float("nan")
+    return float(valid_returns.mean())
+
+
+def compute_metrics(daily_returns: Sequence[float]) -> Dict[str, Optional[float]]:
+    arr = np.asarray(daily_returns, dtype=float)
+    arr = arr[np.isfinite(arr)]
     if len(arr) == 0:
-        return {}
-    # geometric annualized return
+        return {"annualized_return": None, "sharpe": None, "max_drawdown": None, "days": 0}
+
     cumulative = np.prod(1 + arr)
     years = len(arr) / 252.0
-    ann_return = cumulative ** (1 / years) - 1 if years > 0 else float("nan")
+    annualized_return = cumulative ** (1 / years) - 1 if years > 0 else np.nan
     mean_daily = arr.mean()
     std_daily = arr.std(ddof=1) if len(arr) > 1 else 0.0
-    sharpe = (mean_daily * 252) / (std_daily * np.sqrt(252)) if std_daily > 0 else float("nan")
-    # max drawdown
+    sharpe = mean_daily / std_daily * np.sqrt(252) if std_daily > 0 else np.nan
     wealth = np.cumprod(1 + arr)
     peak = np.maximum.accumulate(wealth)
     drawdown = (wealth - peak) / peak
-    max_dd = float(np.min(drawdown))
+
     return {
-        "annualized_return": float(ann_return),
-        "sharpe": float(sharpe) if not np.isnan(sharpe) else None,
-        "max_drawdown": float(max_dd),
+        "annualized_return": float(annualized_return) if np.isfinite(annualized_return) else None,
+        "sharpe": float(sharpe) if np.isfinite(sharpe) else None,
+        "max_drawdown": float(np.min(drawdown)),
         "days": int(len(arr)),
     }
+
+
+def train_predictor_for_day(
+    model,
+    returns: pd.DataFrame,
+    industry_df: pd.DataFrame,
+    concept_df: pd.DataFrame,
+    stock_codes: Sequence[str],
+    day_index: int,
+    lookback: int,
+    train_window: int,
+    top_neighbor_count: int,
+    cluster_count: int,
+    seed_value: int,
+    device: torch.device,
+    min_cluster_valid_count: int,
+    epochs: int,
+) -> Optional[ClusterReturnPredictor]:
+    feature_batches = []
+    label_batches = []
+    for train_index in range(day_index - train_window, day_index):
+        try:
+            data = build_data_for_index(
+                returns, industry_df, concept_df, stock_codes, train_index, lookback, top_neighbor_count
+            )
+            embeddings = extract_embeddings(model, data, device)
+            labels = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10).fit_predict(embeddings)
+            features, cluster_returns, _ = build_cluster_samples(
+                embeddings,
+                labels,
+                returns.iloc[train_index].to_numpy(dtype=float),
+                min_valid_count=min_cluster_valid_count,
+            )
+        except ValueError as error:
+            print(f"[警告] 跳过训练日 {train_index}: {error}")
+            continue
+        feature_batches.append(features)
+        label_batches.append(cluster_returns)
+
+    if not feature_batches:
+        return None
+
+    x_train = np.vstack(feature_batches)
+    y_train = np.concatenate(label_batches)
+    predictor = ClusterReturnPredictor(input_dim=x_train.shape[1], hidden_dim=32, dropout_rate=0.1)
+    return train_cluster_predictor(
+        predictor,
+        x_train,
+        y_train,
+        device,
+        epochs=epochs,
+        batch_size=32,
+        learning_rate=1e-3,
+    )
+
+
+def evaluate_prediction_ic(predictions: np.ndarray, realized_cluster_returns: np.ndarray) -> float:
+    mask = np.isfinite(predictions) & np.isfinite(realized_cluster_returns)
+    if mask.sum() < 2:
+        return float("nan")
+    return float(np.corrcoef(predictions[mask], realized_cluster_returns[mask])[0, 1])
 
 
 def run_backtest(
@@ -341,97 +314,126 @@ def run_backtest(
     model_path: str = "best_model.pt",
     lookback: int = 60,
     train_window: int = 60,
+    top_neighbor_count: int = 20,
     cluster_count: int = 20,
     top_k_clusters: int = 3,
     seed_value: int = 42,
-):
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    out_dir: str = "outputs/cluster_backtest",
+    min_cluster_valid_count: int = 3,
+    min_portfolio_valid_stocks: int = 1,
+    predictor_epochs: int = 20,
+    device: Optional[torch.device] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Optional[float]]]:
+    os.makedirs(out_dir, exist_ok=True)
     set_seed(seed_value)
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     returns = load_returns_csv(os.path.join(data_dir, "daily_returns.csv"))
     stock_codes = list(returns.columns)
     industry_df = load_industry_mapping(os.path.join(data_dir, "industry_mapping.csv"), stock_codes)
     concept_df = load_concept_mapping(data_dir, stock_codes)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_embedding_model(model_path, in_channels=6, hidden_channels=64, num_relations=3, device=device)
+    embedding_model = load_embedding_model(model_path, in_channels=6, hidden_channels=64, num_relations=3, device=device)
 
-    start_i = lookback + train_window
-    daily_portfolio_returns = []
-    daily_cluster_ics = []
     selected_records = []
+    daily_returns = []
+    cluster_ics = []
 
-    for i in range(start_i, len(returns) - 1):
-        print(f"[状态] 回测日期索引 {i}, 日期 {returns.index[i].date()}")
-        # build training dataset from previous train_window days
-        X_list = []
-        y_list = []
-        for j in range(i - train_window, i):
-            try:
-                data_j = build_data_for_index(returns, industry_df, concept_df, stock_codes, j, lookback, top_neighbor_count=20)
-                emb_j = extract_embeddings(model, data_j, device)
-                kmeans = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10)
-                labels_j = kmeans.fit_predict(emb_j)
-                next_returns_j = returns.iloc[j].to_numpy(dtype=float)
-                feat, lab, _ = build_cluster_samples(emb_j, labels_j, next_returns_j)
-                X_list.append(feat)
-                y_list.append(lab)
-            except Exception as e:
-                print(f"[警告] 构造训练日 {j} 时发生错误: {e}")
-                continue
-        if not X_list:
-            print("[状态] 未生成任何训练簇样本，跳过该日")
+    for day_index in date_positions(returns, lookback, train_window, start_date, end_date):
+        trade_date = returns.index[day_index]
+        print(f"[状态] 回测日期 {trade_date.date()} (index={day_index})")
+        predictor = train_predictor_for_day(
+            embedding_model,
+            returns,
+            industry_df,
+            concept_df,
+            stock_codes,
+            day_index,
+            lookback,
+            train_window,
+            top_neighbor_count,
+            cluster_count,
+            seed_value,
+            device,
+            min_cluster_valid_count,
+            predictor_epochs,
+        )
+        if predictor is None:
+            print("[警告] 历史训练样本为空，跳过该日")
             continue
-        X_train = np.vstack(X_list)
-        y_train = np.concatenate(y_list)
-        predictor = ClusterReturnPredictor(input_dim=X_train.shape[1], hidden_dim=32, dropout_rate=0.1)
-        predictor = train_cluster_predictor(predictor, X_train, y_train, device, epochs=20, batch_size=32, learning_rate=1e-3)
 
-        # predict for day i
-        data_i = build_data_for_index(returns, industry_df, concept_df, stock_codes, i, lookback, top_neighbor_count=20)
-        emb_i = extract_embeddings(model, data_i, device)
-        kmeans_i = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10)
-        labels_i = kmeans_i.fit_predict(emb_i)
-        cluster_feats_i, cluster_labels_mean_i, cluster_id_list_i = build_cluster_samples(emb_i, labels_i, returns.iloc[i].to_numpy(dtype=float))
-        pred_cluster_returns = predict_cluster_returns(predictor, cluster_feats_i, device)
+        data = build_data_for_index(
+            returns, industry_df, concept_df, stock_codes, day_index, lookback, top_neighbor_count
+        )
+        embeddings = extract_embeddings(embedding_model, data, device)
+        labels = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10).fit_predict(embeddings)
+        cluster_features, cluster_ids = build_cluster_feature_samples(embeddings, labels)
+        predicted_cluster_returns = predict_cluster_returns(predictor, cluster_features, device)
 
-        # compute cluster IC (pearson) between pred and realized cluster mean returns
-        try:
-            if len(pred_cluster_returns) > 1:
-                ic = float(np.corrcoef(pred_cluster_returns, cluster_labels_mean_i)[0, 1])
-            else:
-                ic = float('nan')
-        except Exception:
-            ic = float('nan')
-        daily_cluster_ics.append(ic)
-
-        # select top-k clusters
-        top_idx = np.argsort(pred_cluster_returns)[-top_k_clusters:][::-1]
-        selected_clusters = [cluster_id_list_i[idx] for idx in top_idx]
+        top_count = min(max(1, top_k_clusters), len(cluster_ids))
+        top_indices = np.argsort(predicted_cluster_returns)[-top_count:][::-1]
+        selected_clusters = {cluster_ids[index] for index in top_indices}
         selected_stocks = [
-            code for code, lab in zip(stock_codes, labels_i) if lab in selected_clusters
+            code for code, cluster_label in zip(stock_codes, labels) if int(cluster_label) in selected_clusters
         ]
-        # compute portfolio return as equal-weighted average of selected stocks' realized return at day i
-        realized_returns_i = returns.iloc[i].reindex(selected_stocks).to_numpy(dtype=float)
-        realized_returns_i = realized_returns_i[~np.isnan(realized_returns_i)]
-        if realized_returns_i.size == 0:
-            port_ret = 0.0
-        else:
-            port_ret = float(np.nanmean(realized_returns_i))
-        daily_portfolio_returns.append(port_ret)
-        selected_records.append({"date": str(returns.index[i].date()), "n_selected": int(len(selected_stocks)), "selected_stocks": selected_stocks})
-        print(f"[状态] 日期 {returns.index[i].date()} 选股数={len(selected_stocks)} 组合日收益={port_ret:.6f} cluster_ic={ic}")
+        portfolio_return = compute_portfolio_return(
+            returns.iloc[day_index],
+            selected_stocks,
+            min_valid_stocks=min_portfolio_valid_stocks,
+        )
 
-    # 保存结果
-    os.makedirs("outputs", exist_ok=True)
-    pd.DataFrame(selected_records).to_csv(os.path.join("outputs", "selected_stocks_cluster.csv"), index=False)
-    pd.DataFrame({"daily_return": daily_portfolio_returns}, index=None).to_csv(os.path.join("outputs", "daily_returns_cluster.csv"), index=False)
-    metrics = compute_metrics(daily_portfolio_returns)
-    metrics["mean_cluster_ic"] = float(np.nanmean([v for v in daily_cluster_ics if not np.isnan(v)])) if daily_cluster_ics else None
-    with open(os.path.join("outputs", "metrics_cluster.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
-    print("[状态] 回测完成，结果已保存到 outputs/")
-    return metrics
+        try:
+            _, realized_cluster_returns, realized_cluster_ids = build_cluster_samples(
+                embeddings,
+                labels,
+                returns.iloc[day_index].to_numpy(dtype=float),
+                min_valid_count=min_cluster_valid_count,
+            )
+            realized_by_id = dict(zip(realized_cluster_ids, realized_cluster_returns))
+            aligned_realized = np.array([realized_by_id.get(cluster_id, np.nan) for cluster_id in cluster_ids])
+            cluster_ic = evaluate_prediction_ic(predicted_cluster_returns, aligned_realized)
+        except ValueError:
+            cluster_ic = float("nan")
+
+        daily_returns.append(portfolio_return)
+        cluster_ics.append(cluster_ic)
+        selected_records.append(
+            {
+                "date": str(trade_date.date()),
+                "daily_return": portfolio_return,
+                "num_stocks": int(len(selected_stocks)),
+                "num_valid_returns": int(returns.iloc[day_index].reindex(selected_stocks).notna().sum()),
+                "selected_clusters": sorted(selected_clusters),
+                "selected_stocks": selected_stocks,
+            }
+        )
+        print(
+            f"[状态] 日期 {trade_date.date()} 选股数={len(selected_stocks)} "
+            f"组合日收益={portfolio_return:.6f} cluster_ic={cluster_ic}"
+        )
+
+        if len(selected_records) % 10 == 0:
+            pd.DataFrame(selected_records).to_csv(os.path.join(out_dir, "daily_returns_partial.csv"), index=False)
+
+    result_df = pd.DataFrame(selected_records)
+    result_df.to_csv(os.path.join(out_dir, "daily_returns.csv"), index=False)
+
+    metrics = compute_metrics(daily_returns)
+    finite_ics = [value for value in cluster_ics if np.isfinite(value)]
+    metrics["mean_cluster_ic"] = float(np.mean(finite_ics)) if finite_ics else None
+    with open(os.path.join(out_dir, "metrics.json"), "w") as file:
+        json.dump(metrics, file, indent=2)
+
+    print(f"[状态] 回测完成，结果已保存到 {out_dir}/")
+    return result_df, metrics
+
+
+def run_daily_cluster_backtest(**kwargs) -> pd.DataFrame:
+    result_df, _ = run_backtest(**kwargs)
+    return result_df
 
 
 if __name__ == "__main__":
-    # 简单命令行执行入口
-    metrics = run_backtest()
-    print(metrics)
+    _, backtest_metrics = run_backtest()
+    print(backtest_metrics)

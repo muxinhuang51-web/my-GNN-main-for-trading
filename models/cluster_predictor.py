@@ -36,26 +36,49 @@ def mean_pool_vectors(vectors: np.ndarray, indices: List[int]) -> np.ndarray:
     return vectors[indices].mean(axis=0)
 
 
-def mean_pool_labels(labels: np.ndarray, indices: List[int]) -> float:
+def mean_pool_labels(labels: np.ndarray, indices: List[int]) -> Tuple[float, int]:
     """计算指定索引集合的均值标签。"""
     label_values = labels[indices]
-    if np.all(np.isnan(label_values)):
-        return float("nan")
-    return float(np.nanmean(label_values))
+    valid_values = label_values[~np.isnan(label_values)]
+    if valid_values.size == 0:
+        return float("nan"), 0
+    return float(valid_values.mean()), int(valid_values.size)
 
 
-def build_cluster_samples(embeddings: np.ndarray, cluster_labels: np.ndarray, next_returns: np.ndarray) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+def build_cluster_feature_samples(embeddings: np.ndarray, cluster_labels: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    """仅按簇聚合特征，不读取未来收益。"""
+    index_map = group_indices_by_label(cluster_labels)
+    feature_list: List[np.ndarray] = []
+    cluster_id_list: List[int] = []
+    for cluster_id in sorted(index_map):
+        feature_list.append(mean_pool_vectors(embeddings, index_map[cluster_id]))
+        cluster_id_list.append(cluster_id)
+    if not feature_list:
+        raise ValueError("簇级特征为空，请检查聚类标签")
+    return np.vstack(feature_list), cluster_id_list
+
+
+def build_cluster_samples(
+    embeddings: np.ndarray,
+    cluster_labels: np.ndarray,
+    next_returns: np.ndarray,
+    min_valid_count: int = 1,
+    min_valid_fraction: float = 0.0,
+) -> Tuple[np.ndarray, np.ndarray, List[int]]:
     """从股票级样本构造簇级样本。"""
     print("[状态] 开始构造簇级样本...")
     index_map = group_indices_by_label(cluster_labels)
     feature_list: List[np.ndarray] = []
     label_list: List[float] = []
     cluster_id_list: List[int] = []
-    # 比喻注释：把同一簇的股票当成一篮水果，先打成果汁再拿去评判口感
-    for cluster_id, indices in index_map.items():
+    for cluster_id in sorted(index_map):
+        indices = index_map[cluster_id]
         cluster_feature = mean_pool_vectors(embeddings, indices)
-        cluster_label = mean_pool_labels(next_returns, indices)
+        cluster_label, valid_count = mean_pool_labels(next_returns, indices)
+        valid_fraction = valid_count / len(indices)
         if np.isnan(cluster_label):
+            continue
+        if valid_count < min_valid_count or valid_fraction < min_valid_fraction:
             continue
         feature_list.append(cluster_feature)
         label_list.append(cluster_label)
@@ -66,9 +89,13 @@ def build_cluster_samples(embeddings: np.ndarray, cluster_labels: np.ndarray, ne
     return np.vstack(feature_list), np.array(label_list), cluster_id_list
 
 
-def iterate_minibatches(features: torch.Tensor, labels: torch.Tensor, batch_size: int):
+def iterate_minibatches(features: torch.Tensor, labels: torch.Tensor, batch_size: int, shuffle: bool = True):
     """按 batch 迭代样本。"""
     total = features.size(0)
+    if shuffle:
+        order = torch.randperm(total, device=features.device)
+        features = features[order]
+        labels = labels[order]
     for start in range(0, total, batch_size):
         end = min(start + batch_size, total)
         yield features[start:end], labels[start:end]
