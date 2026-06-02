@@ -18,7 +18,16 @@ from models.cluster_predictor import (
 from models.embedding_model import extract_embeddings, load_embedding_model
 
 
+# 本文件负责“簇级轮动”回测：
+# 1. 用历史窗口构造股票特征和关系图
+# 2. 用训练好的 GNN 导出股票 embedding
+# 3. 对 embedding 聚类，得到股票簇
+# 4. 用过去窗口训练簇收益预测器
+# 5. 选择预测收益最高的簇，计算当日组合收益
+
+
 def set_seed(seed_value: int) -> None:
+    """固定随机种子，尽量让 KMeans 和 torch 训练结果可复现。"""
     torch.manual_seed(seed_value)
     np.random.seed(seed_value)
     if torch.cuda.is_available():
@@ -26,6 +35,7 @@ def set_seed(seed_value: int) -> None:
 
 
 def load_returns_csv(path: str) -> pd.DataFrame:
+    """读取日收益率表，并整理成 index=日期、columns=股票代码的矩阵。"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"收益率文件不存在: {path}")
     dataframe = pd.read_csv(path)
@@ -40,6 +50,7 @@ def load_returns_csv(path: str) -> pd.DataFrame:
 
 
 def load_industry_mapping(path: str, stock_codes: Sequence[str]) -> pd.DataFrame:
+    """读取行业映射，只保留当前股票池里的股票。"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"行业映射不存在: {path}")
     dataframe = pd.read_csv(path)
@@ -48,6 +59,7 @@ def load_industry_mapping(path: str, stock_codes: Sequence[str]) -> pd.DataFrame
 
 
 def load_concept_mapping(data_dir: str, stock_codes: Sequence[str]) -> pd.DataFrame:
+    """读取概念映射；如果数据文件不存在，则返回空表，后续图构造会自动跳过概念边。"""
     candidates = [
         os.path.join(data_dir, "stock_concept.csv"),
         os.path.join(data_dir, "concept_mapping.csv"),
@@ -71,12 +83,15 @@ def load_concept_mapping(data_dir: str, stock_codes: Sequence[str]) -> pd.DataFr
 
 
 def zscore_by_column(dataframe: pd.DataFrame) -> pd.DataFrame:
+    """对每个特征列做横截面标准化。"""
     mean = dataframe.mean(axis=0)
     std = dataframe.std(axis=0).replace(0, np.nan)
     return (dataframe - mean) / std
 
 
 def build_features_from_window(window_dataframe: pd.DataFrame) -> pd.DataFrame:
+    """从历史收益窗口构造每只股票的节点特征。"""
+    # 这些特征全部来自 time_index 之前的窗口，避免在特征里混入预测日收益。
     momentum_20 = (1 + window_dataframe.tail(20)).prod() - 1
     mean_5 = window_dataframe.tail(5).mean()
     mean_10 = window_dataframe.tail(10).mean()
@@ -97,6 +112,7 @@ def build_features_from_window(window_dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_stock2index(stock_codes: Sequence[str]) -> Dict[str, int]:
+    """生成股票代码到节点编号的映射，保证边索引和特征矩阵对齐。"""
     return {code: index for index, code in enumerate(stock_codes)}
 
 
@@ -107,6 +123,7 @@ def build_group_edges(
     group_column: str,
     max_neighbors: int = 20,
 ) -> Optional[np.ndarray]:
+    """根据行业或概念分组构造同组股票之间的有向边。"""
     if mapping_df.empty or stock_column not in mapping_df.columns or group_column not in mapping_df.columns:
         return None
 
@@ -115,6 +132,7 @@ def build_group_edges(
     for members in grouped.values():
         members = sorted({member for member in members if member in stock2index}, key=stock2index.get)
         for source in members:
+            # 限制每个股票的同组邻居数量，避免大行业或大概念生成过密的图。
             peers = [member for member in members if member != source][:max_neighbors]
             for target in peers:
                 edge_pairs.add((stock2index[source], stock2index[target]))
@@ -128,6 +146,7 @@ def build_corr_edges(
     top_neighbor_count: int = 20,
     min_overlap: int = 20,
 ) -> Optional[np.ndarray]:
+    """根据历史收益相关性构造股票之间的相似边。"""
     if len(window_dataframe) < min_overlap:
         return None
 
@@ -142,6 +161,7 @@ def build_corr_edges(
         candidates = np.flatnonzero(finite_mask)
         ranked = candidates[np.argsort(np.abs(row[candidates]))]
         for target_index in ranked[-top_neighbor_count:]:
+            # 取绝对相关性最高的若干邻居，正相关和负相关都被视为强关系。
             edge_pairs.add((source_index, int(target_index)))
 
     if not edge_pairs:
@@ -150,6 +170,7 @@ def build_corr_edges(
 
 
 def tensor_from_edges(edge_index: Optional[np.ndarray]) -> torch.Tensor:
+    """把 numpy 边索引转成 PyTorch Tensor；缺失边时返回空边。"""
     if edge_index is None:
         return torch.empty((2, 0), dtype=torch.long)
     return torch.tensor(edge_index, dtype=torch.long)
@@ -164,13 +185,16 @@ def build_data_for_index(
     lookback: int,
     top_neighbor_count: int,
 ) -> Data:
+    """为某个交易日构造 PyG Data，作为 GNN embedding 模型的输入。"""
     if time_index < lookback:
         raise ValueError("time_index 小于 lookback，无法构造历史窗口")
 
+    # 使用 [time_index - lookback, time_index) 的历史收益构造预测日特征。
     window = returns.iloc[time_index - lookback:time_index]
     feature_frame = build_features_from_window(window).reindex(stock_codes).fillna(0.0)
     stock2index = build_stock2index(stock_codes)
 
+    # 三类关系边：行业边、概念边、历史相关性边。
     industry_edge = tensor_from_edges(
         build_group_edges(industry_df, stock2index, "ts_code", "industry", max_neighbors=20)
     )
@@ -181,6 +205,7 @@ def build_data_for_index(
         build_corr_edges(window.reindex(columns=stock_codes), top_neighbor_count=top_neighbor_count)
     )
 
+    # edge_type 与 edge_index 的列一一对应：0=行业，1=概念，2=相关性。
     edge_parts = [industry_edge, concept_edge, corr_edge]
     type_parts = [
         torch.zeros(industry_edge.size(1), dtype=torch.long),
@@ -204,6 +229,7 @@ def date_positions(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> List[int]:
+    """给出可回测的日期下标，确保每个日期都有足够 lookback 和训练窗口。"""
     start_index = lookback + train_window
     valid_positions = list(range(start_index, len(returns)))
     if start_date is not None:
@@ -216,6 +242,7 @@ def date_positions(
 
 
 def compute_portfolio_return(returns_row: pd.Series, selected_stocks: Sequence[str], min_valid_stocks: int = 1) -> float:
+    """计算当日选中股票的等权平均收益。"""
     if not selected_stocks:
         return 0.0
     valid_returns = returns_row.reindex(selected_stocks).dropna()
@@ -225,6 +252,7 @@ def compute_portfolio_return(returns_row: pd.Series, selected_stocks: Sequence[s
 
 
 def compute_metrics(daily_returns: Sequence[float]) -> Dict[str, Optional[float]]:
+    """根据日收益序列计算年化收益、Sharpe 和最大回撤。"""
     arr = np.asarray(daily_returns, dtype=float)
     arr = arr[np.isfinite(arr)]
     if len(arr) == 0:
@@ -264,15 +292,23 @@ def train_predictor_for_day(
     min_cluster_valid_count: int,
     epochs: int,
 ) -> Optional[ClusterReturnPredictor]:
+    """为某个回测日训练簇收益预测器。
+
+    训练数据来自 [day_index - train_window, day_index)。
+    对每个历史训练日，先用该日之前的 lookback 窗口导出 embedding，
+    再聚类并构造簇级特征，标签是该训练日的真实簇平均收益。
+    """
     feature_batches = []
     label_batches = []
     for train_index in range(day_index - train_window, day_index):
         try:
+            # 训练日的特征只来自 train_index 之前的历史窗口。
             data = build_data_for_index(
                 returns, industry_df, concept_df, stock_codes, train_index, lookback, top_neighbor_count
             )
             embeddings = extract_embeddings(model, data, device)
             labels = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10).fit_predict(embeddings)
+            # 标签使用 train_index 当天收益；这对应“历史窗口 -> 当天收益”的监督样本。
             features, cluster_returns, _ = build_cluster_samples(
                 embeddings,
                 labels,
@@ -290,6 +326,7 @@ def train_predictor_for_day(
 
     x_train = np.vstack(feature_batches)
     y_train = np.concatenate(label_batches)
+    # 当前版本每天从零初始化簇预测器；后续可改成继承昨日 checkpoint 做日频微调。
     predictor = ClusterReturnPredictor(input_dim=x_train.shape[1], hidden_dim=32, dropout_rate=0.1)
     return train_cluster_predictor(
         predictor,
@@ -303,6 +340,7 @@ def train_predictor_for_day(
 
 
 def evaluate_prediction_ic(predictions: np.ndarray, realized_cluster_returns: np.ndarray) -> float:
+    """计算簇预测收益和真实簇收益之间的截面相关系数。"""
     mask = np.isfinite(predictions) & np.isfinite(realized_cluster_returns)
     if mask.sum() < 2:
         return float("nan")
@@ -326,10 +364,19 @@ def run_backtest(
     predictor_epochs: int = 20,
     device: Optional[torch.device] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Optional[float]]]:
+    """运行簇级轮动回测。
+
+    当前版本的核心特点：
+    - GNN embedding 模型固定加载 `best_model.pt`
+    - 每个回测日重新训练一个簇收益预测器
+    - 每个回测日重新 KMeans 聚类
+    - 选择预测收益最高的 Top-K 簇做等权组合
+    """
     os.makedirs(out_dir, exist_ok=True)
     set_seed(seed_value)
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 基础数据：收益矩阵、行业/概念映射、预训练 GNN embedding 模型。
     returns = load_returns_csv(os.path.join(data_dir, "daily_returns.csv"))
     stock_codes = list(returns.columns)
     industry_df = load_industry_mapping(os.path.join(data_dir, "industry_mapping.csv"), stock_codes)
@@ -343,6 +390,7 @@ def run_backtest(
     for day_index in date_positions(returns, lookback, train_window, start_date, end_date):
         trade_date = returns.index[day_index]
         print(f"[状态] 回测日期 {trade_date.date()} (index={day_index})")
+        # 第一步：用过去 train_window 天训练当天的簇收益预测器。
         predictor = train_predictor_for_day(
             embedding_model,
             returns,
@@ -363,14 +411,17 @@ def run_backtest(
             print("[警告] 历史训练样本为空，跳过该日")
             continue
 
+        # 第二步：为当前回测日构造图并导出股票 embedding。
         data = build_data_for_index(
             returns, industry_df, concept_df, stock_codes, day_index, lookback, top_neighbor_count
         )
         embeddings = extract_embeddings(embedding_model, data, device)
+        # 第三步：对当前日 embedding 聚类，并预测每个簇的收益。
         labels = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10).fit_predict(embeddings)
         cluster_features, cluster_ids = build_cluster_feature_samples(embeddings, labels)
         predicted_cluster_returns = predict_cluster_returns(predictor, cluster_features, device)
 
+        # 第四步：选出预测收益最高的 Top-K 簇，并把簇映射回股票列表。
         top_count = min(max(1, top_k_clusters), len(cluster_ids))
         top_indices = np.argsort(predicted_cluster_returns)[-top_count:][::-1]
         selected_clusters = {cluster_ids[index] for index in top_indices}
@@ -384,6 +435,7 @@ def run_backtest(
         )
 
         try:
+            # 用当前日真实收益计算簇级 IC，仅用于评估预测质量，不参与选股。
             _, realized_cluster_returns, realized_cluster_ids = build_cluster_samples(
                 embeddings,
                 labels,
@@ -398,6 +450,7 @@ def run_backtest(
 
         daily_returns.append(portfolio_return)
         cluster_ics.append(cluster_ic)
+        # 记录每日选择结果，后续可用于分析簇轮动、选股数量和组合收益。
         selected_records.append(
             {
                 "date": str(trade_date.date()),
@@ -414,8 +467,10 @@ def run_backtest(
         )
 
         if len(selected_records) % 10 == 0:
+            # 长回测时保留中间结果，避免运行中断后完全没有输出。
             pd.DataFrame(selected_records).to_csv(os.path.join(out_dir, "daily_returns_partial.csv"), index=False)
 
+    # 回测结束后保存完整逐日结果和汇总指标。
     result_df = pd.DataFrame(selected_records)
     result_df.to_csv(os.path.join(out_dir, "daily_returns.csv"), index=False)
 
@@ -430,6 +485,7 @@ def run_backtest(
 
 
 def run_daily_cluster_backtest(**kwargs) -> pd.DataFrame:
+    """兼容 notebook 或外部脚本调用：只返回逐日回测结果。"""
     result_df, _ = run_backtest(**kwargs)
     return result_df
 
