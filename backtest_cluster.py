@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -11,7 +12,6 @@ from torch_geometric.data import Data
 from models.cluster_predictor import (
     ClusterReturnPredictor,
     build_cluster_feature_samples,
-    build_cluster_samples,
     predict_cluster_returns,
     train_cluster_predictor,
 )
@@ -147,6 +147,8 @@ def build_corr_edges(
     min_overlap: int = 20,
 ) -> Optional[np.ndarray]:
     """根据历史收益相关性构造股票之间的相似边。"""
+    if top_neighbor_count <= 0:
+        return None
     if len(window_dataframe) < min_overlap:
         return None
 
@@ -226,12 +228,18 @@ def date_positions(
     returns: pd.DataFrame,
     lookback: int,
     train_window: int,
+    min_market_valid_stocks: int = 1000,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
 ) -> List[int]:
     """给出可回测的日期下标，确保每个日期都有足够 lookback 和训练窗口。"""
     start_index = lookback + train_window
-    valid_positions = list(range(start_index, len(returns)))
+    valid_counts = returns.notna().sum(axis=1)
+    valid_positions = [
+        index
+        for index in range(start_index, len(returns))
+        if valid_counts.iloc[index] >= min_market_valid_stocks
+    ]
     if start_date is not None:
         start = pd.to_datetime(start_date)
         valid_positions = [index for index in valid_positions if returns.index[index] >= start]
@@ -249,6 +257,104 @@ def compute_portfolio_return(returns_row: pd.Series, selected_stocks: Sequence[s
     if len(valid_returns) < min_valid_stocks:
         return float("nan")
     return float(valid_returns.mean())
+
+
+def select_clusters_until_target_valid_stocks(
+    cluster_ids: Sequence[int],
+    predicted_cluster_returns: np.ndarray,
+    stock_codes: Sequence[str],
+    cluster_labels: np.ndarray,
+    returns_row: pd.Series,
+    target_valid_stocks: int,
+) -> Tuple[List[int], List[str], int]:
+    """按预测收益降序逐簇加入，直到有效股票数量达到目标。"""
+    ranked_indices = np.argsort(predicted_cluster_returns)[::-1]
+    selected_clusters: List[int] = []
+    selected_stocks: List[str] = []
+    selected_stock_set = set()
+    valid_count = 0
+
+    for cluster_index in ranked_indices:
+        cluster_id = int(cluster_ids[cluster_index])
+        cluster_stocks = [
+            code for code, label in zip(stock_codes, cluster_labels) if int(label) == cluster_id
+        ]
+        cluster_valid_count = int(returns_row.reindex(cluster_stocks).notna().sum())
+        if cluster_valid_count == 0:
+            continue
+
+        selected_clusters.append(cluster_id)
+        for code in cluster_stocks:
+            if code not in selected_stock_set:
+                selected_stocks.append(code)
+                selected_stock_set.add(code)
+
+        valid_count += cluster_valid_count
+        if valid_count >= target_valid_stocks:
+            break
+
+    return selected_clusters, selected_stocks, valid_count
+
+
+def get_day_embeddings(
+    embedding_cache: Dict[Tuple[int, int], np.ndarray],
+    model,
+    returns: pd.DataFrame,
+    industry_df: pd.DataFrame,
+    concept_df: pd.DataFrame,
+    stock_codes: Sequence[str],
+    day_index: int,
+    lookback: int,
+    top_neighbor_count: int,
+    device: torch.device,
+) -> np.ndarray:
+    """读取或计算某日股票 embedding。"""
+    cache_key = (day_index, top_neighbor_count)
+    if cache_key not in embedding_cache:
+        data = build_data_for_index(
+            returns, industry_df, concept_df, stock_codes, day_index, lookback, top_neighbor_count
+        )
+        embedding_cache[cache_key] = extract_embeddings(model, data, device)
+    return embedding_cache[cache_key]
+
+
+def get_day_clusters(
+    cluster_cache: Dict[Tuple[int, int, int, int, int], Tuple[np.ndarray, np.ndarray, List[int]]],
+    embedding_cache: Dict[Tuple[int, int], np.ndarray],
+    model,
+    returns: pd.DataFrame,
+    industry_df: pd.DataFrame,
+    concept_df: pd.DataFrame,
+    stock_codes: Sequence[str],
+    day_index: int,
+    lookback: int,
+    top_neighbor_count: int,
+    cluster_count: int,
+    seed_value: int,
+    kmeans_n_init: int,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray, List[int]]:
+    """读取或计算某日 KMeans 标签和簇级特征。"""
+    cache_key = (day_index, top_neighbor_count, cluster_count, seed_value, kmeans_n_init)
+    if cache_key not in cluster_cache:
+        embeddings = get_day_embeddings(
+            embedding_cache,
+            model,
+            returns,
+            industry_df,
+            concept_df,
+            stock_codes,
+            day_index,
+            lookback,
+            top_neighbor_count,
+            device,
+        )
+        labels = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=kmeans_n_init).fit_predict(
+            embeddings
+        )
+        cluster_features, cluster_ids = build_cluster_feature_samples(embeddings, labels)
+        cluster_cache[cache_key] = (labels, cluster_features, cluster_ids)
+    return cluster_cache[cache_key]
 
 
 def compute_metrics(daily_returns: Sequence[float]) -> Dict[str, Optional[float]]:
@@ -276,6 +382,68 @@ def compute_metrics(daily_returns: Sequence[float]) -> Dict[str, Optional[float]
     }
 
 
+def export_backtest_plots(result_df: pd.DataFrame, out_dir: str) -> None:
+    """导出累计净值、日收益和回撤曲线。"""
+    if result_df.empty or "daily_return" not in result_df.columns:
+        print("[警告] 回测结果为空，跳过绘图")
+        return
+
+    plot_df = result_df.copy()
+    plot_df["date"] = pd.to_datetime(plot_df["date"], errors="coerce")
+    plot_df["daily_return"] = pd.to_numeric(plot_df["daily_return"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["date", "daily_return"]).sort_values("date")
+    if plot_df.empty:
+        print("[警告] 回测结果没有有效日期或收益，跳过绘图")
+        return
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plot_df["cum_return"] = (1 + plot_df["daily_return"]).cumprod()
+    peak = plot_df["cum_return"].cummax()
+    plot_df["drawdown"] = (plot_df["cum_return"] - peak) / peak
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(plot_df["date"], plot_df["cum_return"], label="cum_return")
+    plt.xlabel("date")
+    plt.ylabel("net value")
+    plt.title("Cumulative Return")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "cum_return.png"), dpi=150)
+    plt.close()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(plot_df["date"], plot_df["daily_return"], label="daily_return")
+    plt.axhline(0, color="black", linewidth=0.8)
+    plt.xlabel("date")
+    plt.ylabel("return")
+    plt.title("Daily Return")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "daily_return.png"), dpi=150)
+    plt.close()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(plot_df["date"], plot_df["drawdown"], label="drawdown")
+    plt.xlabel("date")
+    plt.ylabel("drawdown")
+    plt.title("Drawdown")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "drawdown.png"), dpi=150)
+    plt.close()
+
+    print(f"[状态] 回测图表已保存到 {out_dir}/")
+
+
 def train_predictor_for_day(
     model,
     returns: pd.DataFrame,
@@ -291,6 +459,9 @@ def train_predictor_for_day(
     device: torch.device,
     min_cluster_valid_count: int,
     epochs: int,
+    kmeans_n_init: int,
+    embedding_cache: Dict[Tuple[int, int], np.ndarray],
+    cluster_cache: Dict[Tuple[int, int, int, int, int], Tuple[np.ndarray, np.ndarray, List[int]]],
 ) -> Optional[ClusterReturnPredictor]:
     """为某个回测日训练簇收益预测器。
 
@@ -302,19 +473,39 @@ def train_predictor_for_day(
     label_batches = []
     for train_index in range(day_index - train_window, day_index):
         try:
-            # 训练日的特征只来自 train_index 之前的历史窗口。
-            data = build_data_for_index(
-                returns, industry_df, concept_df, stock_codes, train_index, lookback, top_neighbor_count
+            # 训练日的特征只来自 train_index 之前的历史窗口；embedding 和聚类结果做内存缓存。
+            labels, cluster_features, cluster_ids = get_day_clusters(
+                cluster_cache,
+                embedding_cache,
+                model,
+                returns,
+                industry_df,
+                concept_df,
+                stock_codes,
+                train_index,
+                lookback,
+                top_neighbor_count,
+                cluster_count,
+                seed_value,
+                kmeans_n_init,
+                device,
             )
-            embeddings = extract_embeddings(model, data, device)
-            labels = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10).fit_predict(embeddings)
             # 标签使用 train_index 当天收益；这对应“历史窗口 -> 当天收益”的监督样本。
-            features, cluster_returns, _ = build_cluster_samples(
-                embeddings,
-                labels,
-                returns.iloc[train_index].to_numpy(dtype=float),
-                min_valid_count=min_cluster_valid_count,
-            )
+            returns_array = returns.iloc[train_index].to_numpy(dtype=float)
+            features = []
+            cluster_returns = []
+            for cluster_position, cluster_id in enumerate(cluster_ids):
+                member_indices = np.flatnonzero(labels == cluster_id)
+                valid_returns = returns_array[member_indices]
+                valid_returns = valid_returns[np.isfinite(valid_returns)]
+                if valid_returns.size < min_cluster_valid_count:
+                    continue
+                features.append(cluster_features[cluster_position])
+                cluster_returns.append(float(valid_returns.mean()))
+            if not features:
+                raise ValueError("训练日没有满足有效样本数的簇")
+            features = np.vstack(features)
+            cluster_returns = np.asarray(cluster_returns, dtype=float)
         except ValueError as error:
             print(f"[警告] 跳过训练日 {train_index}: {error}")
             continue
@@ -351,17 +542,20 @@ def run_backtest(
     data_dir: str = "data",
     model_path: str = "best_model.pt",
     lookback: int = 60,
-    train_window: int = 60,
-    top_neighbor_count: int = 20,
+    train_window: int = 20,
+    top_neighbor_count: int = 0,
     cluster_count: int = 20,
     top_k_clusters: int = 3,
     seed_value: int = 42,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     out_dir: str = "outputs/cluster_backtest",
-    min_cluster_valid_count: int = 3,
-    min_portfolio_valid_stocks: int = 1,
-    predictor_epochs: int = 20,
+    min_cluster_valid_count: int = 5,
+    min_portfolio_valid_stocks: int = 50,
+    target_portfolio_valid_stocks: int = 100,
+    min_market_valid_stocks: int = 1000,
+    predictor_epochs: int = 3,
+    kmeans_n_init: int = 1,
     device: Optional[torch.device] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Optional[float]]]:
     """运行簇级轮动回测。
@@ -370,7 +564,8 @@ def run_backtest(
     - GNN embedding 模型固定加载 `best_model.pt`
     - 每个回测日重新训练一个簇收益预测器
     - 每个回测日重新 KMeans 聚类
-    - 选择预测收益最高的 Top-K 簇做等权组合
+    - 按预测收益排序逐簇加入，直到有效股票数达到目标
+    - 默认关闭相关性边，以优先保证运行速度和结果可复现性
     """
     os.makedirs(out_dir, exist_ok=True)
     set_seed(seed_value)
@@ -386,10 +581,31 @@ def run_backtest(
     selected_records = []
     daily_returns = []
     cluster_ics = []
+    embedding_cache: Dict[Tuple[int, int], np.ndarray] = {}
+    cluster_cache: Dict[Tuple[int, int, int, int, int], Tuple[np.ndarray, np.ndarray, List[int]]] = {}
+    positions = date_positions(
+        returns,
+        lookback,
+        train_window,
+        min_market_valid_stocks=min_market_valid_stocks,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
-    for day_index in date_positions(returns, lookback, train_window, start_date, end_date):
+    print(
+        f"[状态] 可回测日期数={len(positions)}，"
+        f"min_market_valid_stocks={min_market_valid_stocks}，"
+        f"target_portfolio_valid_stocks={target_portfolio_valid_stocks}"
+    )
+
+    for day_number, day_index in enumerate(positions, start=1):
+        day_start_time = time.perf_counter()
         trade_date = returns.index[day_index]
-        print(f"[状态] 回测日期 {trade_date.date()} (index={day_index})")
+        market_valid_count = int(returns.iloc[day_index].notna().sum())
+        print(
+            f"[状态] 回测日期 {trade_date.date()} (index={day_index}, "
+            f"{day_number}/{len(positions)}, market_valid={market_valid_count})"
+        )
         # 第一步：用过去 train_window 天训练当天的簇收益预测器。
         predictor = train_predictor_for_day(
             embedding_model,
@@ -406,28 +622,42 @@ def run_backtest(
             device,
             min_cluster_valid_count,
             predictor_epochs,
+            kmeans_n_init,
+            embedding_cache,
+            cluster_cache,
         )
         if predictor is None:
             print("[警告] 历史训练样本为空，跳过该日")
             continue
 
-        # 第二步：为当前回测日构造图并导出股票 embedding。
-        data = build_data_for_index(
-            returns, industry_df, concept_df, stock_codes, day_index, lookback, top_neighbor_count
+        # 第二步：读取或计算当前日聚类结果，并预测每个簇的收益。
+        labels, cluster_features, cluster_ids = get_day_clusters(
+            cluster_cache,
+            embedding_cache,
+            embedding_model,
+            returns,
+            industry_df,
+            concept_df,
+            stock_codes,
+            day_index,
+            lookback,
+            top_neighbor_count,
+            cluster_count,
+            seed_value,
+            kmeans_n_init,
+            device,
         )
-        embeddings = extract_embeddings(embedding_model, data, device)
-        # 第三步：对当前日 embedding 聚类，并预测每个簇的收益。
-        labels = KMeans(n_clusters=cluster_count, random_state=seed_value, n_init=10).fit_predict(embeddings)
-        cluster_features, cluster_ids = build_cluster_feature_samples(embeddings, labels)
         predicted_cluster_returns = predict_cluster_returns(predictor, cluster_features, device)
 
-        # 第四步：选出预测收益最高的 Top-K 簇，并把簇映射回股票列表。
-        top_count = min(max(1, top_k_clusters), len(cluster_ids))
-        top_indices = np.argsort(predicted_cluster_returns)[-top_count:][::-1]
-        selected_clusters = {cluster_ids[index] for index in top_indices}
-        selected_stocks = [
-            code for code, cluster_label in zip(stock_codes, labels) if int(cluster_label) in selected_clusters
-        ]
+        # 第四步：按预测收益从高到低逐簇加入，直到组合有效股票数达到目标。
+        selected_clusters, selected_stocks, num_valid_returns = select_clusters_until_target_valid_stocks(
+            cluster_ids,
+            predicted_cluster_returns,
+            stock_codes,
+            labels,
+            returns.iloc[day_index],
+            target_valid_stocks=target_portfolio_valid_stocks,
+        )
         portfolio_return = compute_portfolio_return(
             returns.iloc[day_index],
             selected_stocks,
@@ -436,16 +666,17 @@ def run_backtest(
 
         try:
             # 用当前日真实收益计算簇级 IC，仅用于评估预测质量，不参与选股。
-            _, realized_cluster_returns, realized_cluster_ids = build_cluster_samples(
-                embeddings,
-                labels,
-                returns.iloc[day_index].to_numpy(dtype=float),
-                min_valid_count=min_cluster_valid_count,
-            )
-            realized_by_id = dict(zip(realized_cluster_ids, realized_cluster_returns))
+            returns_array = returns.iloc[day_index].to_numpy(dtype=float)
+            realized_by_id = {}
+            for cluster_id in cluster_ids:
+                member_indices = np.flatnonzero(labels == cluster_id)
+                valid_returns = returns_array[member_indices]
+                valid_returns = valid_returns[np.isfinite(valid_returns)]
+                if valid_returns.size >= min_cluster_valid_count:
+                    realized_by_id[cluster_id] = float(valid_returns.mean())
             aligned_realized = np.array([realized_by_id.get(cluster_id, np.nan) for cluster_id in cluster_ids])
             cluster_ic = evaluate_prediction_ic(predicted_cluster_returns, aligned_realized)
-        except ValueError:
+        except Exception:
             cluster_ic = float("nan")
 
         daily_returns.append(portfolio_return)
@@ -456,14 +687,15 @@ def run_backtest(
                 "date": str(trade_date.date()),
                 "daily_return": portfolio_return,
                 "num_stocks": int(len(selected_stocks)),
-                "num_valid_returns": int(returns.iloc[day_index].reindex(selected_stocks).notna().sum()),
-                "selected_clusters": sorted(selected_clusters),
+                "num_valid_returns": int(num_valid_returns),
+                "selected_clusters": selected_clusters,
                 "selected_stocks": selected_stocks,
             }
         )
         print(
             f"[状态] 日期 {trade_date.date()} 选股数={len(selected_stocks)} "
-            f"组合日收益={portfolio_return:.6f} cluster_ic={cluster_ic}"
+            f"有效股票数={num_valid_returns} 组合日收益={portfolio_return:.6f} "
+            f"cluster_ic={cluster_ic} 耗时={time.perf_counter() - day_start_time:.1f}s"
         )
 
         if len(selected_records) % 10 == 0:
@@ -473,6 +705,7 @@ def run_backtest(
     # 回测结束后保存完整逐日结果和汇总指标。
     result_df = pd.DataFrame(selected_records)
     result_df.to_csv(os.path.join(out_dir, "daily_returns.csv"), index=False)
+    export_backtest_plots(result_df, out_dir)
 
     metrics = compute_metrics(daily_returns)
     finite_ics = [value for value in cluster_ics if np.isfinite(value)]

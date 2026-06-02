@@ -51,7 +51,7 @@
 3. 加载 `best_model.pt` 并导出节点 embedding。
 4. 对股票 embedding 做 KMeans 聚类。
 5. 只用历史窗口训练簇收益预测器。
-6. 在预测日根据簇预测收益选出 Top 簇。
+6. 在预测日按簇预测收益排序，逐簇加入直到达到目标有效持仓数。
 7. 计算等权组合收益并保存回测结果。
 
 ## 环境
@@ -85,6 +85,29 @@ tushare
 python backtest_cluster.py
 ```
 
+运行有边界的参数优化：
+
+```bash
+python optimize_cluster_backtest.py
+```
+
+优化脚本默认最多尝试 6 组参数、总时间最多 120 分钟、单组参数最多 20 分钟。每组参数会在独立子进程中运行，超时后会被终止，汇总结果写入：
+
+```text
+outputs/cluster_backtest_experiments/summary_bounded.json
+```
+
+如果只想快速验证流程，可以限制到一个交易日和一个 trial：
+
+```bash
+python optimize_cluster_backtest.py \
+  --max-trials 1 \
+  --max-minutes 10 \
+  --trial-timeout-minutes 5 \
+  --start-date 2026-05-22 \
+  --end-date 2026-05-22
+```
+
 也可以在 Python 中指定较短日期范围做调试：
 
 ```python
@@ -104,6 +127,28 @@ print(metrics)
 ```text
 outputs/cluster_backtest/
 ```
+
+当前 `backtest_cluster.py` 的默认回测设置偏向可运行性和稳定性：
+
+- 训练窗口 `train_window=20`，减少单日训练成本。
+- 默认关闭相关性边 `top_neighbor_count=0`，避免相关矩阵和密集边拖慢回测。
+- 聚类数 `cluster_count=20`。
+- 按预测簇收益从高到低逐簇加入，直到目标有效持仓数 `target_portfolio_valid_stocks=100`。
+- 跳过有效股票数不足 `min_market_valid_stocks=1000` 的交易日，避免数据残缺日期污染指标。
+
+最近一次正式输出位于 `outputs/cluster_backtest/`，回测区间为 2026-03-16 到 2026-05-22，共 46 个有效交易日。当前指标：
+
+```json
+{
+  "annualized_return": 1.4001169069532642,
+  "sharpe": 2.8376923052578196,
+  "max_drawdown": -0.11118583088512288,
+  "days": 46,
+  "mean_cluster_ic": 0.06939749818547629
+}
+```
+
+注意：46 个交易日样本仍然偏短，指标只能说明当前数据片段下的有效性，后续应补充更长区间、交易成本、换手率和 CPU/GPU 一致性验证。
 
 ## 数据文件
 
@@ -133,4 +178,3 @@ outputs/cluster_backtest/
 - 删除 Python 缓存目录 `__pycache__/` 和 `models/__pycache__/`。
 - 新增 `.gitignore`，防止环境、缓存和输出产物再次进入 Git。
 - 新增本 README，说明项目结构、环境和运行方式。
-
