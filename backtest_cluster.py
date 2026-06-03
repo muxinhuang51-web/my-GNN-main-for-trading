@@ -538,6 +538,98 @@ def evaluate_prediction_ic(predictions: np.ndarray, realized_cluster_returns: np
     return float(np.corrcoef(predictions[mask], realized_cluster_returns[mask])[0, 1])
 
 
+def json_safe(value):
+    """把 numpy/pandas 标量和 NaN 转成 JSON 友好的 Python 类型。"""
+    if value is None:
+        return None
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        return float(value) if np.isfinite(value) else None
+    if isinstance(value, (np.ndarray,)):
+        return [json_safe(item) for item in value.tolist()]
+    if isinstance(value, (pd.Timestamp,)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
+def write_json(path: str, payload: Dict) -> None:
+    """原子写入 JSON 文件，避免中断时留下半截文件。"""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as file:
+        json.dump(json_safe(payload), file, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, path)
+
+
+def write_jsonl(path: str, records: Sequence[Dict]) -> None:
+    """写入 JSON Lines，便于逐日复盘和后续脚本读取。"""
+    tmp_path = f"{path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as file:
+        for record in records:
+            file.write(json.dumps(json_safe(record), ensure_ascii=False))
+            file.write("\n")
+    os.replace(tmp_path, path)
+
+
+def build_cluster_decisions(
+    cluster_ids: Sequence[int],
+    predicted_cluster_returns: np.ndarray,
+    stock_codes: Sequence[str],
+    cluster_labels: np.ndarray,
+    returns_row: pd.Series,
+    selected_clusters: Sequence[int],
+    realized_by_id: Dict[int, float],
+) -> List[Dict]:
+    """整理每个簇的预测、真实收益和是否入选。"""
+    selected_cluster_set = {int(cluster_id) for cluster_id in selected_clusters}
+    decisions = []
+    ranked_indices = np.argsort(predicted_cluster_returns)[::-1]
+    for rank, cluster_index in enumerate(ranked_indices, start=1):
+        cluster_id = int(cluster_ids[cluster_index])
+        member_codes = [
+            code for code, label in zip(stock_codes, cluster_labels) if int(label) == cluster_id
+        ]
+        valid_count = int(returns_row.reindex(member_codes).notna().sum())
+        decisions.append(
+            {
+                "rank": rank,
+                "cluster_id": cluster_id,
+                "predicted_return": float(predicted_cluster_returns[cluster_index]),
+                "realized_return": realized_by_id.get(cluster_id),
+                "member_count": int(len(member_codes)),
+                "valid_return_count": valid_count,
+                "selected": cluster_id in selected_cluster_set,
+            }
+        )
+    return decisions
+
+
+def build_selected_stock_details(
+    selected_stocks: Sequence[str],
+    stock_codes: Sequence[str],
+    cluster_labels: np.ndarray,
+    returns_row: pd.Series,
+) -> List[Dict]:
+    """整理入选股票所属簇和预测日真实收益，方便复查具体持仓。"""
+    stock_to_position = {code: position for position, code in enumerate(stock_codes)}
+    details = []
+    for code in selected_stocks:
+        position = stock_to_position.get(code)
+        daily_return = returns_row.get(code, np.nan)
+        details.append(
+            {
+                "ts_code": code,
+                "cluster_id": int(cluster_labels[position]) if position is not None else None,
+                "daily_return": float(daily_return) if np.isfinite(daily_return) else None,
+            }
+        )
+    return details
+
+
 def run_backtest(
     data_dir: str = "data",
     model_path: str = "best_model.pt",
@@ -591,6 +683,51 @@ def run_backtest(
         start_date=start_date,
         end_date=end_date,
     )
+    run_parameters = {
+        "data_dir": data_dir,
+        "model_path": model_path,
+        "lookback": lookback,
+        "train_window": train_window,
+        "top_neighbor_count": top_neighbor_count,
+        "cluster_count": cluster_count,
+        "top_k_clusters": top_k_clusters,
+        "top_k_clusters_note": "保留兼容参数；当前选股使用 target_portfolio_valid_stocks 逐簇加入。",
+        "seed_value": seed_value,
+        "start_date": start_date,
+        "end_date": end_date,
+        "out_dir": out_dir,
+        "min_cluster_valid_count": min_cluster_valid_count,
+        "min_portfolio_valid_stocks": min_portfolio_valid_stocks,
+        "target_portfolio_valid_stocks": target_portfolio_valid_stocks,
+        "min_market_valid_stocks": min_market_valid_stocks,
+        "predictor_epochs": predictor_epochs,
+        "kmeans_n_init": kmeans_n_init,
+        "device": str(device),
+    }
+    run_context = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "parameters": run_parameters,
+        "data": {
+            "returns_path": os.path.join(data_dir, "daily_returns.csv"),
+            "stock_count": int(len(stock_codes)),
+            "date_count": int(len(returns)),
+            "data_start_date": str(returns.index.min().date()) if len(returns) else None,
+            "data_end_date": str(returns.index.max().date()) if len(returns) else None,
+        },
+        "backtest_dates": {
+            "count": int(len(positions)),
+            "start": str(returns.index[positions[0]].date()) if positions else None,
+            "end": str(returns.index[positions[-1]].date()) if positions else None,
+        },
+        "output_files": {
+            "daily_returns_csv": "daily_returns.csv",
+            "daily_decisions_jsonl": "daily_decisions.jsonl",
+            "run_config_json": "run_config.json",
+            "run_summary_json": "run_summary.json",
+            "metrics_json": "metrics.json",
+        },
+    }
+    write_json(os.path.join(out_dir, "run_config.json"), run_context)
 
     print(
         f"[状态] 可回测日期数={len(positions)}，"
@@ -664,20 +801,32 @@ def run_backtest(
             min_valid_stocks=min_portfolio_valid_stocks,
         )
 
-        try:
-            # 用当前日真实收益计算簇级 IC，仅用于评估预测质量，不参与选股。
-            returns_array = returns.iloc[day_index].to_numpy(dtype=float)
-            realized_by_id = {}
-            for cluster_id in cluster_ids:
-                member_indices = np.flatnonzero(labels == cluster_id)
-                valid_returns = returns_array[member_indices]
-                valid_returns = valid_returns[np.isfinite(valid_returns)]
-                if valid_returns.size >= min_cluster_valid_count:
-                    realized_by_id[cluster_id] = float(valid_returns.mean())
-            aligned_realized = np.array([realized_by_id.get(cluster_id, np.nan) for cluster_id in cluster_ids])
-            cluster_ic = evaluate_prediction_ic(predicted_cluster_returns, aligned_realized)
-        except Exception:
-            cluster_ic = float("nan")
+        # 用当前日真实收益计算簇级 IC，仅用于评估预测质量，不参与选股。
+        returns_array = returns.iloc[day_index].to_numpy(dtype=float)
+        realized_by_id = {}
+        for cluster_id in cluster_ids:
+            member_indices = np.flatnonzero(labels == cluster_id)
+            valid_returns = returns_array[member_indices]
+            valid_returns = valid_returns[np.isfinite(valid_returns)]
+            if valid_returns.size >= min_cluster_valid_count:
+                realized_by_id[int(cluster_id)] = float(valid_returns.mean())
+        aligned_realized = np.array([realized_by_id.get(int(cluster_id), np.nan) for cluster_id in cluster_ids])
+        cluster_ic = evaluate_prediction_ic(predicted_cluster_returns, aligned_realized)
+        cluster_decisions = build_cluster_decisions(
+            cluster_ids,
+            predicted_cluster_returns,
+            stock_codes,
+            labels,
+            returns.iloc[day_index],
+            selected_clusters,
+            realized_by_id,
+        )
+        selected_stock_details = build_selected_stock_details(
+            selected_stocks,
+            stock_codes,
+            labels,
+            returns.iloc[day_index],
+        )
 
         daily_returns.append(portfolio_return)
         cluster_ics.append(cluster_ic)
@@ -690,6 +839,8 @@ def run_backtest(
                 "num_valid_returns": int(num_valid_returns),
                 "selected_clusters": selected_clusters,
                 "selected_stocks": selected_stocks,
+                "cluster_decisions": cluster_decisions,
+                "selected_stock_details": selected_stock_details,
             }
         )
         print(
@@ -700,11 +851,32 @@ def run_backtest(
 
         if len(selected_records) % 10 == 0:
             # 长回测时保留中间结果，避免运行中断后完全没有输出。
-            pd.DataFrame(selected_records).to_csv(os.path.join(out_dir, "daily_returns_partial.csv"), index=False)
+            partial_df = pd.DataFrame(
+                [
+                    {
+                        key: value
+                        for key, value in record.items()
+                        if key not in {"cluster_decisions", "selected_stock_details"}
+                    }
+                    for record in selected_records
+                ]
+            )
+            partial_df.to_csv(os.path.join(out_dir, "daily_returns_partial.csv"), index=False)
+            write_jsonl(os.path.join(out_dir, "daily_decisions_partial.jsonl"), selected_records)
 
     # 回测结束后保存完整逐日结果和汇总指标。
-    result_df = pd.DataFrame(selected_records)
+    result_df = pd.DataFrame(
+        [
+            {
+                key: value
+                for key, value in record.items()
+                if key not in {"cluster_decisions", "selected_stock_details"}
+            }
+            for record in selected_records
+        ]
+    )
     result_df.to_csv(os.path.join(out_dir, "daily_returns.csv"), index=False)
+    write_jsonl(os.path.join(out_dir, "daily_decisions.jsonl"), selected_records)
     export_backtest_plots(result_df, out_dir)
 
     metrics = compute_metrics(daily_returns)
@@ -712,6 +884,10 @@ def run_backtest(
     metrics["mean_cluster_ic"] = float(np.mean(finite_ics)) if finite_ics else None
     with open(os.path.join(out_dir, "metrics.json"), "w") as file:
         json.dump(metrics, file, indent=2)
+    run_summary = dict(run_context)
+    run_summary["finished_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    run_summary["metrics"] = metrics
+    write_json(os.path.join(out_dir, "run_summary.json"), run_summary)
 
     print(f"[状态] 回测完成，结果已保存到 {out_dir}/")
     return result_df, metrics
