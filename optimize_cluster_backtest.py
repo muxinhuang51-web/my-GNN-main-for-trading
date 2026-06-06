@@ -84,8 +84,12 @@ def score_metrics(metrics: Dict[str, Any], min_days: int) -> Optional[float]:
 
     sharpe = finite_float(metrics.get("sharpe"))
     annualized_return = finite_float(metrics.get("annualized_return"))
-    max_drawdown = finite_float(metrics.get("max_drawdown"))
+    max_drawdown = finite_float(metrics.get("max_drawdown"), default=None)
     mean_cluster_ic = finite_float(metrics.get("mean_cluster_ic"))
+
+    # 缺失关键指标（如回撤）时拒绝打分，避免残缺结果获得虚高排名。
+    if max_drawdown is None:
+        return None
 
     # Sharpe is the primary signal. Annual return is squashed so short samples
     # cannot dominate, drawdown is negative and therefore penalizes the score.
