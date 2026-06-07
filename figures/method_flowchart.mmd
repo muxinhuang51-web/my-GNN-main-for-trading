@@ -1,0 +1,53 @@
+flowchart TB
+    %% Figure 1: Research framework for the paper.
+
+    A["Raw Data<br/>Returns / Industry / Concept / Text"]
+    B["Rolling Window<br/>R_{t-L:t-1}"]
+    C["Node Features X_t<br/>mom20 / mean5 / mean10 / vol20 / vol60 / last_ret"]
+
+    D["Dynamic Heterogeneous Graph G_t"]
+    D1["Industry Edges"]
+    D2["Concept Edges"]
+    D3["Return-Correlation Edges"]
+    D4["LLM Semantic Edges<br/>(optional extension)"]
+
+    E["RGCN Representation Learning"]
+    F["Stock Embeddings Z_t"]
+
+    G["Dynamic Clustering<br/>KMeans on Z_t"]
+    H["Stock Clusters C_{j,t}"]
+
+    I["Cluster Representation<br/>g_{j,t}=mean(z_i)"]
+    J["Cluster Return Predictor<br/>MLP"]
+    K["Predicted Cluster Returns<br/>y_hat_{j,t}"]
+
+    L["Cluster Rotation Portfolio"]
+    M["Select Top Predicted Clusters<br/>until target valid holdings"]
+    N["Equal-Weight Stocks in Selected Clusters"]
+
+    O["Backtest and Evaluation"]
+    P["Annual Return / Sharpe / MDD / IC"]
+
+    A --> B --> C
+    A --> D1 --> D
+    A --> D2 --> D
+    B --> D3 --> D
+    A --> D4 --> D
+    C --> E
+    D --> E
+    E --> F
+    F --> G --> H
+    H --> I --> J --> K
+    K --> L --> M --> N --> O --> P
+
+    classDef dataCls fill:#eef6ff,stroke:#4c78a8,stroke-width:1px,color:#111;
+    classDef graphCls fill:#f4f0ff,stroke:#7b61ff,stroke-width:1px,color:#111;
+    classDef modelCls fill:#eefaf1,stroke:#3a9152,stroke-width:1px,color:#111;
+    classDef portfolioCls fill:#fff7e6,stroke:#d18b00,stroke-width:1px,color:#111;
+    classDef evalCls fill:#fff0f0,stroke:#c44e52,stroke-width:1px,color:#111;
+
+    class A,B,C dataCls;
+    class D,D1,D2,D3,D4 graphCls;
+    class E,F,G,H,I,J,K modelCls;
+    class L,M,N portfolioCls;
+    class O,P evalCls;
