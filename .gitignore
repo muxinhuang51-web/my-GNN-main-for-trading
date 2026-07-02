@@ -1,24 +1,41 @@
-# Python cache
+# Python caches and virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Virtual environments
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .venv/
 venv/
 env/
 
-# Jupyter runtime files
-.ipynb_checkpoints/
-
-# Local secrets and environment variables
-.env
-.env.*
-
-# Generated backtest artifacts
-outputs/
-cluster_profile.csv
-
-# Local IDE metadata
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
 .vscode/
 
+# Local agent/upload scratch space
+.agents/
+.uploads/
+
+# Project data, trained weights, and generated experiment outputs
+data/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.npy
+best_model.pt
+metrics.json
+cluster_profile.csv
+cv_page_*.png
+
+# Logs and local run metadata
+*.log
+pid.txt
+
+# Personal GraphRAG inputs and generated reports
+academic-opportunity-graphrag/profiles/*.json
+academic-opportunity-graphrag/outputs/

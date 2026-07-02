@@ -18,7 +18,6 @@ class StockRGCNEmbedding(torch.nn.Module):
     def forward(self, node_features, edge_index, edge_type, return_embedding: bool = False):
         hidden = self.conv1(node_features, edge_index, edge_type)  # 隐层表示
         hidden = functional.relu(hidden)  # 非线性激活
-        # conv2 输出直接作为嵌入，不加 ReLU，保持嵌入空间为线性映射，回归头可学习线性组合。
         embedding = self.conv2(hidden, edge_index, edge_type)  # 最终嵌入
         if return_embedding:
             return embedding

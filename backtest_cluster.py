@@ -83,11 +83,7 @@ def load_concept_mapping(data_dir: str, stock_codes: Sequence[str]) -> pd.DataFr
 
 
 def zscore_by_column(dataframe: pd.DataFrame) -> pd.DataFrame:
-    """对每个特征列做横截面标准化。
-
-    零标准差列（所有股票值相同）替换为 NaN，后续由调用方 fillna(0) 处理，
-    此时该特征不含区分度，填 0 等价于将其从模型输入中置零。
-    """
+    """对每个特征列做横截面标准化。"""
     mean = dataframe.mean(axis=0)
     std = dataframe.std(axis=0).replace(0, np.nan)
     return (dataframe - mean) / std
@@ -99,9 +95,8 @@ def build_features_from_window(window_dataframe: pd.DataFrame) -> pd.DataFrame:
     momentum_20 = (1 + window_dataframe.tail(20)).prod() - 1
     mean_5 = window_dataframe.tail(5).mean()
     mean_10 = window_dataframe.tail(10).mean()
-    # 历史波动率：截取不超过窗口实际长度的天数，避免 lookback < 60 时静默退化。
-    volatility_20 = window_dataframe.tail(min(20, len(window_dataframe))).std(ddof=0)
-    volatility_60 = window_dataframe.tail(min(60, len(window_dataframe))).std(ddof=0)
+    volatility_20 = window_dataframe.tail(20).std(ddof=0)
+    volatility_60 = window_dataframe.tail(60).std(ddof=0)
     last_return = window_dataframe.tail(1).iloc[0]
     feature_frame = pd.DataFrame(
         {
@@ -295,12 +290,8 @@ def select_clusters_until_target_valid_stocks(
                 selected_stock_set.add(code)
 
         valid_count += cluster_valid_count
-        # 最后一个簇整体加入，valid_count 可能超过 target；论文中注明此行为即可。
         if valid_count >= target_valid_stocks:
             break
-
-    if not selected_stocks:
-        print(f"[警告] 所有 {len(cluster_ids)} 个簇有效股票数均为 0，当日组合为空，记为 0 收益")
 
     return selected_clusters, selected_stocks, valid_count
 
@@ -373,14 +364,13 @@ def compute_metrics(daily_returns: Sequence[float]) -> Dict[str, Optional[float]
     if len(arr) == 0:
         return {"annualized_return": None, "sharpe": None, "max_drawdown": None, "days": 0}
 
-    # 使用 log1p + exp 组合避免 float64 溢出（np.prod 在长回测下可能超过 1e308）。
-    log_cumulative = np.sum(np.log1p(arr))
+    cumulative = np.prod(1 + arr)
     years = len(arr) / 252.0
-    annualized_return = np.exp(log_cumulative / years) - 1 if years > 0 else np.nan
+    annualized_return = cumulative ** (1 / years) - 1 if years > 0 else np.nan
     mean_daily = arr.mean()
     std_daily = arr.std(ddof=1) if len(arr) > 1 else 0.0
     sharpe = mean_daily / std_daily * np.sqrt(252) if std_daily > 0 else np.nan
-    wealth = np.exp(np.cumsum(np.log1p(arr)))
+    wealth = np.cumprod(1 + arr)
     peak = np.maximum.accumulate(wealth)
     drawdown = (wealth - peak) / peak
 
