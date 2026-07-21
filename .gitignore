@@ -23,6 +23,7 @@ Thumbs.db
 # Project data, trained weights, and generated experiment outputs
 data/
 outputs/
+outputs_v2/
 *.pt
 *.pth
 *.ckpt
@@ -39,3 +40,5 @@ pid.txt
 # Personal GraphRAG inputs and generated reports
 academic-opportunity-graphrag/profiles/*.json
 academic-opportunity-graphrag/outputs/
+.env
+data_v2/
