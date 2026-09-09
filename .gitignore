@@ -1,0 +1,44 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local agent/upload scratch space
+.agents/
+.uploads/
+
+# Project data, trained weights, and generated experiment outputs
+data/
+outputs/
+outputs_v2/
+*.pt
+*.pth
+*.ckpt
+*.npy
+best_model.pt
+metrics.json
+cluster_profile.csv
+cv_page_*.png
+
+# Logs and local run metadata
+*.log
+pid.txt
+
+# Personal GraphRAG inputs and generated reports
+academic-opportunity-graphrag/profiles/*.json
+academic-opportunity-graphrag/outputs/
+.env
+data_v2/

@@ -1,0 +1,35 @@
+[
+  {
+    "name": "Shuo Sun",
+    "chinese_name": "孙朔",
+    "institution": "HKUST(GZ)",
+    "homepage": "https://sunshuo01.github.io",
+    "areas": ["AI for Finance", "reinforcement learning", "quantitative trading", "FinTech"],
+    "notes": "Seed from public RA/PhD recruiting post.",
+    "coauthors": [
+      {
+        "name": "Bo An",
+        "institution": "Nanyang Technological University",
+        "homepage": "https://personal.ntu.edu.sg/boan/"
+      }
+    ]
+  },
+  {
+    "name": "Hui Xiong",
+    "chinese_name": "熊辉",
+    "institution": "HKUST(GZ)",
+    "homepage": "https://hkustai.github.io",
+    "areas": ["data mining", "business analytics", "AI", "FinTech"],
+    "notes": "Homepage has prospective student information.",
+    "coauthors": []
+  },
+  {
+    "name": "Muhan Zhang",
+    "chinese_name": "张牧瀚",
+    "institution": "Peking University",
+    "homepage": "https://muhanzhang.github.io",
+    "areas": ["graph neural networks", "graph learning", "subgraph GNN", "theory"],
+    "notes": "Strong GNN theory seed.",
+    "coauthors": []
+  }
+]
